@@ -79,12 +79,15 @@ var url = "https://raw.githubusercontent.com/xzkutor/kubernetes/main/configs/set
 resp.settings = toNative(new org.yaml.snakeyaml.Yaml().load(new com.hivext.api.core.utils.Transport().get(url)));
 var f = resp.settings.fields;
 
-let latestDefaultVersion = "v1.31.14";
+let latestDefaultVersion = "v1.34.8";
 
 if (${fn.compareEngine(8.3)} == 1) {
     f[0].items[0].default = latestDefaultVersion;
     f[0].items[0].values.push({ caption: "v1.29.14", value: "v1.29.14" });
     f[0].items[0].values.push({ caption: "v1.30.14", value: "v1.30.14" });
+    f[0].items[0].values.push({ caption: "v1.31.14", value: "v1.31.14" });
+    f[0].items[0].values.push({ caption: "v1.32.13", value: "v1.32.13" });
+    f[0].items[0].values.push({ caption: "v1.33.12", value: "v1.33.12" });
     f[0].items[0].values.push({ caption: latestDefaultVersion, value: latestDefaultVersion });
 }
 
