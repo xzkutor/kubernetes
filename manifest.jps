@@ -1022,11 +1022,6 @@ addons:
 
     actions:
       addon-rancher:
-      - cmd[${nodes.k8sm.master.id}]: kubectl -n cattle-system get deployment rancher &>/dev/null && echo "true" || echo "false"
-      - if ('${response.out}' == 'true'):
-          return:
-            type: info
-            message: Rancher Management Platform is already installed!
       - init-globals-ingress
       - if ('${globals.ingress-dir}' != 'nginx'):
           return:
@@ -1053,10 +1048,11 @@ addons:
       - set:
           rancher_secret: ${response.out}
       - cmd[${nodes.k8sm.master.id}]: |-
-          helm repo add rancher-stable https://releases.rancher.com/server-charts/stable
-          helm repo update
-          helm install rancher rancher-stable/rancher --create-namespace --namespace cattle-system --set tls=external --set bootstrapPassword="${this.rancher_secret}"
-          kubectl -n cattle-system rollout status deploy/rancher
+          rancher_installer="/tmp/install-rancher-workarounds.sh"
+          curl -fsSL "${baseUrl}/scripts/install-rancher-workarounds.sh" -o "$rancher_installer" ||
+            wget -qO "$rancher_installer" "${baseUrl}/scripts/install-rancher-workarounds.sh"
+          chmod 0700 "$rancher_installer"
+          RANCHER_HOSTNAME="${env.domain}" BOOTSTRAP_PASSWORD="${this.rancher_secret}" bash "$rancher_installer"
       - message.email.send:
           to: "${user.email}"
           subject: Rancher Platform Successfully Installed in ${env.name}
