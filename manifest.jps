@@ -1037,30 +1037,53 @@ addons:
           return:
             type: warning
             message: Cannot deploy Rancher UI. Root ingress for ${env.domain} is already used by ${response.out}.
-      - cmd[${nodes.k8sm.master.id}]: cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 32 | head -n 1
+      - cmd[${nodes.k8sm.master.id}]: kubectl -n cattle-system get deployment rancher &>/dev/null && echo "true" || echo "false"
       - set:
-          rancher_secret: ${response.out}
+          rancher_existing: ${response.out}
+      - if ('${this.rancher_existing}' != 'true'):
+          - cmd[${nodes.k8sm.master.id}]: cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 32 | head -n 1
+          - set:
+              rancher_secret: ${response.out}
+      - else:
+          - set:
+              rancher_secret: ""
       - cmd[${nodes.k8sm.master.id}]: |-
           rancher_installer="/tmp/install-rancher-workarounds.sh"
-          curl -fsSL "${baseUrl}/scripts/install-rancher-workarounds.sh" -o "$rancher_installer" ||
-            wget -qO "$rancher_installer" "${baseUrl}/scripts/install-rancher-workarounds.sh"
+          rancher_installer_url="${baseUrl}/scripts/install-rancher-workarounds.sh"
+          if ! curl -fsSL "$rancher_installer_url" -o "$rancher_installer"; then
+            if ! wget -qO "$rancher_installer" "$rancher_installer_url"; then
+              echo "ERROR: cannot download Rancher installer helper from $rancher_installer_url" >&2
+              exit 2
+            fi
+          fi
           chmod 0700 "$rancher_installer"
-          RANCHER_HOSTNAME="${env.domain}" BOOTSTRAP_PASSWORD="${this.rancher_secret}" bash "$rancher_installer"
-      - message.email.send:
-          to: "${user.email}"
-          subject: Rancher Platform Successfully Installed in ${env.name}
-          body: |-
-            Rancher Management Platform installed in <b>${env.name}</b> Kubernetes Cluster: <br>
-            Rancher Dashboard - ${env.url}<br>
-            Your login password: ${this.rancher_secret}
+          if [ -n "${this.rancher_secret}" ]; then
+            RANCHER_HOSTNAME="${env.domain}" BOOTSTRAP_PASSWORD="${this.rancher_secret}" bash "$rancher_installer"
+          else
+            RANCHER_HOSTNAME="${env.domain}" bash "$rancher_installer"
+          fi
+      - if ('${this.rancher_existing}' != 'true'):
+          - message.email.send:
+              to: "${user.email}"
+              subject: Rancher Platform Successfully Installed in ${env.name}
+              body: |-
+                Rancher Management Platform installed in <b>${env.name}</b> Kubernetes Cluster: <br>
+                Rancher Dashboard - ${env.url}<br>
+                Your login password: ${this.rancher_secret}
+          - return:
+              type: success
+              message: |
+                Rancher Platform has been successfully installed!
+
+                Enter [Rancher dashboard](${env.url}), using password:
+
+                ```${this.rancher_secret}```
       - return:
           type: success
           message: |
-            Rancher Platform has been successfully installed!
+            Rancher Platform has been successfully repaired or updated.
 
-            Enter [Rancher dashboard](${env.url}), using password:
-
-            ```${this.rancher_secret}```
+            Existing Rancher credentials were not changed.
 
   - id: regcreds-k8s-addon
     type: update
