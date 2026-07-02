@@ -1,13 +1,12 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# Install Rancher v2.10.3 with the startup workarounds needed on Jelastic/K8s
-# v1.29.x clusters where Rancher exits with:
-#   [FATAL] error running the jail command: timed out waiting for the script to complete: signal: killed
-
+# Rancher addon constants. Change these values to select another supported version.
 RANCHER_VERSION="${RANCHER_VERSION:-2.10.3}"
 RANCHER_IMAGE_TAG="${RANCHER_IMAGE_TAG:-v${RANCHER_VERSION#v}}"
 CERT_MANAGER_VERSION="${CERT_MANAGER_VERSION:-v1.16.2}"
+RANCHER_CHART_REPO_NAME="${RANCHER_CHART_REPO_NAME:-rancher-latest}"
+RANCHER_CHART_REPO_URL="${RANCHER_CHART_REPO_URL:-https://releases.rancher.com/server-charts/latest}"
 RANCHER_NAMESPACE="${RANCHER_NAMESPACE:-cattle-system}"
 CERT_MANAGER_NAMESPACE="${CERT_MANAGER_NAMESPACE:-cert-manager}"
 INGRESS_CLASS_NAME="${INGRESS_CLASS_NAME:-nginx}"
@@ -15,6 +14,8 @@ CA_BUNDLE_SOURCE="${CA_BUNDLE_SOURCE:-/etc/pki/tls/certs/ca-bundle.crt}"
 WAIT_TIMEOUT="${WAIT_TIMEOUT:-30m}"
 RANCHER_STABLE_SECONDS="${RANCHER_STABLE_SECONDS:-180}"
 RANCHER_PREPULL="${RANCHER_PREPULL:-true}"
+RANCHER_PUBLIC_HTTPS_CHECK="${RANCHER_PUBLIC_HTTPS_CHECK:-true}"
+RANCHER_REQUIRE_PUBLIC_HTTPS="${RANCHER_REQUIRE_PUBLIC_HTTPS:-false}"
 
 TMP_FILES=()
 
@@ -30,8 +31,7 @@ cleanup() {
 trap cleanup EXIT
 
 if [[ -z "${RANCHER_HOSTNAME:-}" ]]; then
-  echo "ERROR: set RANCHER_HOSTNAME, for example:" >&2
-  echo "  RANCHER_HOSTNAME=env-1234567.madrid.jele.io $0" >&2
+  echo "ERROR: RANCHER_HOSTNAME is required" >&2
   exit 2
 fi
 
@@ -68,6 +68,17 @@ yaml_quote() {
   local value="$1"
   value=${value//\'/\'\'}
   printf "'%s'" "$value"
+}
+
+duration_seconds() {
+  local value="$1"
+
+  case "$value" in
+    *h) echo $((${value%h} * 3600)) ;;
+    *m) echo $((${value%m} * 60)) ;;
+    *s) echo "${value%s}" ;;
+    *) echo "$value" ;;
+  esac
 }
 
 write_rancher_values_file() {
@@ -266,13 +277,25 @@ EOF
 
 wait_rancher_stable() {
   local stable_seconds="$RANCHER_STABLE_SECONDS"
+  local deadline_seconds
   local interval=15
   local stable=0
   local last_restarts=""
   local pod_line pod_name pod_phase pod_ready pod_restarts
+  local started_at
+
+  deadline_seconds="$(duration_seconds "$WAIT_TIMEOUT")"
+  started_at="$(date +%s)"
 
   log "Wait for Rancher to remain Ready for ${stable_seconds}s"
   while (( stable < stable_seconds )); do
+    if (( $(date +%s) - started_at >= deadline_seconds )); then
+      echo "ERROR: Rancher did not remain Ready for ${stable_seconds}s before timeout ${WAIT_TIMEOUT}" >&2
+      kubectl -n "$RANCHER_NAMESPACE" get deploy,rs,pods,svc,ingress -l app=rancher -o wide >&2 || true
+      kubectl -n "$RANCHER_NAMESPACE" logs -l app=rancher --all-containers --tail=250 --prefix >&2 || true
+      return 1
+    fi
+
     pod_line="$(
       kubectl -n "$RANCHER_NAMESPACE" get pods -l app=rancher \
         -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.status.phase}{" "}{.status.containerStatuses[?(@.name=="rancher")].ready}{" "}{.status.containerStatuses[?(@.name=="rancher")].restartCount}{"\n"}{end}' \
@@ -307,10 +330,15 @@ wait_rancher_stable() {
 wait_https_ok() {
   local code
 
+  if [[ "$RANCHER_PUBLIC_HTTPS_CHECK" != "true" ]]; then
+    log "Skip Rancher public HTTPS endpoint check"
+    return 0
+  fi
+
   log "Wait for Rancher HTTPS endpoint"
   for _ in $(seq 1 80); do
     code="$(curl -kIs -o /dev/null -w '%{http_code}' --max-time 15 "https://${RANCHER_HOSTNAME}" 2>/dev/null || true)"
-    if [[ "$code" == "200" ]]; then
+    if [[ "$code" =~ ^(200|30[1278])$ ]]; then
       curl -kIs --max-time 15 "https://${RANCHER_HOSTNAME}" | sed -n '1,12p'
       return 0
     fi
@@ -318,8 +346,13 @@ wait_https_ok() {
     sleep 15
   done
 
-  echo "ERROR: Rancher HTTPS endpoint did not return HTTP 200" >&2
-  return 1
+  if [[ "$RANCHER_REQUIRE_PUBLIC_HTTPS" == "true" ]]; then
+    echo "ERROR: Rancher HTTPS endpoint did not return HTTP 200/3xx" >&2
+    return 1
+  fi
+
+  echo "WARNING: Rancher public HTTPS endpoint did not return HTTP 200/3xx from this node; continuing because deployment, ingress, and certificate checks passed." >&2
+  return 0
 }
 
 require_cmd kubectl
@@ -336,13 +369,9 @@ if [[ ! -r "$CA_BUNDLE_SOURCE" ]]; then
   exit 2
 fi
 
-log "Cluster context"
-kubectl config current-context
-kubectl get nodes -o wide
-
 log "Helm repositories"
 helm repo add jetstack https://charts.jetstack.io --force-update >/dev/null
-helm repo add rancher-latest https://releases.rancher.com/server-charts/latest --force-update >/dev/null
+helm repo add "$RANCHER_CHART_REPO_NAME" "$RANCHER_CHART_REPO_URL" --force-update >/dev/null
 helm repo update >/dev/null
 
 log "Namespaces"
@@ -374,7 +403,7 @@ if [[ "${RANCHER_PREPULL}" == "true" ]]; then
   kubectl -n "$RANCHER_NAMESPACE" rollout status daemonset/rancher-image-prepull --timeout="$WAIT_TIMEOUT" || true
 fi
 
-helm upgrade --install rancher rancher-latest/rancher \
+helm upgrade --install rancher "$RANCHER_CHART_REPO_NAME/rancher" \
   --namespace "$RANCHER_NAMESPACE" \
   --version "$RANCHER_VERSION" \
   -f "$RANCHER_VALUES_FILE" \

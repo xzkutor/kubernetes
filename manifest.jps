@@ -1022,11 +1022,6 @@ addons:
 
     actions:
       addon-rancher:
-      - cmd[${nodes.k8sm.master.id}]: kubectl -n cattle-system get deployment rancher &>/dev/null && echo "true" || echo "false"
-      - if ('${response.out}' == 'true'):
-          return:
-            type: info
-            message: Rancher Management Platform is already installed!
       - init-globals-ingress
       - if ('${globals.ingress-dir}' != 'nginx'):
           return:
@@ -1036,425 +1031,59 @@ addons:
           kubectl delete -f ${baseUrl}/addons/ingress/${globals.ingress-dir}/helloworld-ingress.yaml ||:
           kubectl delete -f ${baseUrl}/addons/helloworld.yaml ||:
       - cmd[${nodes.k8sm.master.id}]: |-
-          http_code=$(curl -Lks -o /dev/null -w "%{http_code}" "${env.url}")
-          ret_code=$?
-          if [ ${ret_code} -ne 0 ]; then
-            echo "An error occurred while accessing the [endpoint](${env.url})"
-          elif [ ${http_code} -eq 200 ]; then
-            echo "The [endpoint](${env.url}) is already taken"
-          elif [ ${http_code} -ne 404 ]; then
-            echo "The [endpoint](${env.url}) is present and answered with HTTP code ${http_code}"
-          fi
+          kubectl get ingress -A -o jsonpath='{range .items[*]}{.metadata.namespace}{" "}{.metadata.name}{" "}{range .spec.rules[*]}{.host}{" "}{range .http.paths[*]}{.path}{"\n"}{end}{end}{end}' |
+            awk '$3 == "${env.domain}" && ($4 == "/" || $4 == "") && !($1 == "cattle-system" && $2 == "rancher") { print $1 "/" $2 }'
       - if ('${response.out}'):
           return:
             type: warning
-            message: Cannot deploy Rancher UI! ${response.out}.
-      - cmd[${nodes.k8sm.master.id}]: cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 32 | head -n 1
+            message: Cannot deploy Rancher UI. Root ingress for ${env.domain} is already used by ${response.out}.
+      - cmd[${nodes.k8sm.master.id}]: kubectl -n cattle-system get deployment rancher &>/dev/null && echo "true" || echo "false"
       - set:
-          rancher_secret: ${response.out}
+          rancher_existing: ${response.out}
+      - if ('${this.rancher_existing}' != 'true'):
+          - cmd[${nodes.k8sm.master.id}]: cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 32 | head -n 1
+          - set:
+              rancher_secret: ${response.out}
+      - else:
+          - set:
+              rancher_secret: ""
       - cmd[${nodes.k8sm.master.id}]: |-
-          set -Eeuo pipefail
-
-          # Rancher addon constants. Change these values to select another supported version.
-          rancher_version="2.10.3"
-          cert_manager_version="v1.16.2"
-          rancher_chart_repo_name="rancher-latest"
-          rancher_chart_repo_url="https://releases.rancher.com/server-charts/latest"
-          rancher_namespace="cattle-system"
-          cert_manager_namespace="cert-manager"
-          ingress_class_name="nginx"
-          ca_bundle_source="/etc/pki/tls/certs/ca-bundle.crt"
-          wait_timeout="30m"
-          rancher_stable_seconds="180"
-          rancher_prepull="true"
-
-          rancher_image_tag="v$(printf '%s' "$rancher_version" | sed 's/^v//')"
-          rancher_hostname="${env.domain}"
-          bootstrap_password="${this.rancher_secret}"
-          tmp_files=""
-
-          cleanup_rancher_install() {
-            for item in $tmp_files; do
-              rm -f "$item" 2>/dev/null || true
-            done
-            if [ "$rancher_prepull" = "true" ]; then
-              kubectl -n "$rancher_namespace" delete daemonset rancher-image-prepull --ignore-not-found --wait=false >/dev/null 2>&1 || true
-            fi
-          }
-          trap cleanup_rancher_install EXIT
-
-          require_cmd() {
-            command -v "$1" >/dev/null 2>&1 || {
-              echo "ERROR: required command not found: $1" >&2
+          rancher_installer="/tmp/install-rancher-workarounds.sh"
+          rancher_installer_url="${baseUrl}/scripts/install-rancher-workarounds.sh"
+          if ! curl -fsSL "$rancher_installer_url" -o "$rancher_installer"; then
+            if ! wget -qO "$rancher_installer" "$rancher_installer_url"; then
+              echo "ERROR: cannot download Rancher installer helper from $rancher_installer_url" >&2
               exit 2
-            }
-          }
-
-          log_step() {
-            printf '\n== %s ==\n' "$*"
-          }
-
-          yaml_quote() {
-            printf "'"
-            printf "%s" "$1" | sed "s/'/''/g"
-            printf "'"
-          }
-
-          write_rancher_values_file() {
-            values_file="$(mktemp)"
-            tmp_files="$tmp_files $values_file"
-
-            cat >"$values_file" <<EOF
-          hostname: $(yaml_quote "$rancher_hostname")
-          bootstrapPassword: $(yaml_quote "$bootstrap_password")
-          replicas: 1
-          ingress:
-            ingressClassName: $(yaml_quote "$ingress_class_name")
-            tls:
-              source: rancher
-          tls: ingress
-          additionalTrustedCAs: true
-          useBundledSystemChart: true
-          startupProbe:
-            failureThreshold: 180
-            periodSeconds: 10
-            timeoutSeconds: 5
-          livenessProbe:
-            failureThreshold: 30
-            periodSeconds: 30
-            timeoutSeconds: 5
-          readinessProbe:
-            failureThreshold: 30
-            periodSeconds: 30
-            timeoutSeconds: 5
-          extraEnv:
-          - name: CURL_CA_BUNDLE
-            value: /etc/rancher/ssl/ca-additional.pem
-          - name: SSL_CERT_FILE
-            value: /etc/rancher/ssl/ca-additional.pem
-          EOF
-          }
-
-          write_rancher_post_renderer() {
-            post_renderer="$(mktemp)"
-            tmp_files="$tmp_files $post_renderer"
-
-            cat >"$post_renderer" <<'POST_RENDERER'
-          #!/usr/bin/env bash
-          set -Eeuo pipefail
-
-          workdir="$(mktemp -d)"
-          trap 'rm -rf "$workdir"' EXIT
-
-          cat >"$workdir/all.yaml"
-          cat >"$workdir/kustomization.yaml" <<'KUSTOMIZE'
-          resources:
-          - all.yaml
-          patchesStrategicMerge:
-          - rancher-workarounds.yaml
-          KUSTOMIZE
-
-          cat >"$workdir/rancher-workarounds.yaml" <<'PATCH'
-          apiVersion: apps/v1
-          kind: Deployment
-          metadata:
-            name: rancher
-          spec:
-            progressDeadlineSeconds: 3600
-            template:
-              spec:
-                initContainers:
-                - name: rancher-jailer-patch
-                  image: rancher/rancher:__RANCHER_IMAGE_TAG__
-                  imagePullPolicy: IfNotPresent
-                  command:
-                  - /bin/sh
-                  - -ec
-                  args:
-                  - |
-                    sed -e 's/cp -r -l /cp -r /g' -e 's/cp -l /cp /g' /usr/bin/jailer.sh > /patched/jailer.sh
-                    chmod 0755 /patched/jailer.sh
-                    echo "patched /usr/bin/jailer.sh created"
-                    grep -nE 'cp[[:space:]]+(-r[[:space:]]+)?-?l|cp[[:space:]]+-r|cp[[:space:]]+' /patched/jailer.sh | head -40 || true
-                  volumeMounts:
-                  - name: rancher-jailer-script
-                    mountPath: /patched
-                containers:
-                - name: rancher
-                  env:
-                  - name: CATTLE_SYSTEM_CATALOG
-                    value: bundled
-                  - name: CURL_CA_BUNDLE
-                    value: /etc/rancher/ssl/ca-additional.pem
-                  - name: SSL_CERT_FILE
-                    value: /etc/rancher/ssl/ca-additional.pem
-                  volumeMounts:
-                  - name: rancher-jailer-script
-                    mountPath: /usr/bin/jailer.sh
-                    subPath: jailer.sh
-                    readOnly: true
-                  - name: rancher-jail
-                    mountPath: /opt/jail
-                  - name: tls-ca-additional-volume
-                    mountPath: /etc/rancher/ssl/ca-additional.pem
-                    subPath: ca-additional.pem
-                    readOnly: true
-                  - name: tls-ca-additional-volume
-                    mountPath: /etc/pki/trust/anchors/ca-additional.pem
-                    subPath: ca-additional.pem
-                    readOnly: true
-                volumes:
-                - name: rancher-jailer-script
-                  emptyDir: {}
-                - name: rancher-jail
-                  emptyDir:
-                    medium: Memory
-                    sizeLimit: 1Gi
-                - name: tls-ca-additional-volume
-                  secret:
-                    secretName: tls-ca-additional
-                    optional: false
-          PATCH
-
-          sed -i "s/__RANCHER_IMAGE_TAG__/$RANCHER_IMAGE_TAG/g" "$workdir/rancher-workarounds.yaml"
-          kubectl kustomize "$workdir"
-          POST_RENDERER
-
-            chmod 0700 "$post_renderer"
-          }
-
-          start_rancher_image_prepull() {
-            if [ "$rancher_prepull" != "true" ]; then
-              return 0
             fi
-
-            log_step "Pre-pull Rancher image on schedulable nodes"
-            kubectl -n "$rancher_namespace" apply -f - <<EOF
-          apiVersion: apps/v1
-          kind: DaemonSet
-          metadata:
-            name: rancher-image-prepull
-            labels:
-              app: rancher-image-prepull
-          spec:
-            selector:
-              matchLabels:
-                app: rancher-image-prepull
-            template:
-              metadata:
-                labels:
-                  app: rancher-image-prepull
-              spec:
-                terminationGracePeriodSeconds: 1
-                containers:
-                - name: prepull
-                  image: rancher/rancher:$rancher_image_tag
-                  imagePullPolicy: IfNotPresent
-                  command:
-                  - /bin/sh
-                  - -ec
-                  - sleep 1800
-          EOF
-          }
-
-          refresh_tls_ca_secret() {
-            get_error="$(mktemp)"
-            patch_file="$(mktemp)"
-            tmp_files="$tmp_files $get_error $patch_file"
-
-            if kubectl -n "$rancher_namespace" get secret tls-ca-additional >/dev/null 2>"$get_error"; then
-              ca_data="$(base64 "$ca_bundle_source" | tr -d '\n')"
-              cat >"$patch_file" <<EOF
-          {"data":{"ca-additional.pem":"$ca_data"}}
-          EOF
-              if kubectl patch --help 2>/dev/null | grep -q -- '--patch-file'; then
-                kubectl -n "$rancher_namespace" patch secret tls-ca-additional \
-                  --type=merge \
-                  --patch-file "$patch_file"
-              else
-                kubectl -n "$rancher_namespace" patch secret tls-ca-additional \
-                  --type=merge \
-                  -p "$(cat "$patch_file")"
-              fi
-            else
-              get_rc=$?
-              if grep -Eqi 'notfound|not found' "$get_error"; then
-                kubectl -n "$rancher_namespace" create secret generic tls-ca-additional \
-                  --from-file=ca-additional.pem="$ca_bundle_source"
-              else
-                cat "$get_error" >&2
-                return "$get_rc"
-              fi
-            fi
-          }
-
-          wait_rancher_stable() {
-            stable=0
-            last_restarts=""
-            interval=15
-
-            log_step "Wait for Rancher to remain Ready for $rancher_stable_seconds seconds"
-            while [ "$stable" -lt "$rancher_stable_seconds" ]; do
-              pod_line="$(
-                kubectl -n "$rancher_namespace" get pods -l app=rancher \
-                  -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.status.phase}{" "}{.status.containerStatuses[?(@.name=="rancher")].ready}{" "}{.status.containerStatuses[?(@.name=="rancher")].restartCount}{"\n"}{end}' \
-                  | head -1
-              )"
-              set -- $pod_line none none none none
-              pod_name="$1"
-              pod_phase="$2"
-              pod_ready="$3"
-              pod_restarts="$4"
-
-              if [ "$pod_phase" = "Running" ] && [ "$pod_ready" = "true" ]; then
-                if [ "$pod_restarts" = "$last_restarts" ]; then
-                  stable=$((stable + interval))
-                else
-                  stable=0
-                  last_restarts="$pod_restarts"
-                fi
-                printf 'Rancher ready: pod=%s restarts=%s stable=%ss/%ss\n' \
-                  "$pod_name" "$pod_restarts" "$stable" "$rancher_stable_seconds"
-              else
-                stable=0
-                last_restarts="$pod_restarts"
-                [ -n "$pod_name" ] || pod_name="none"
-                [ -n "$pod_phase" ] || pod_phase="none"
-                [ -n "$pod_ready" ] || pod_ready="none"
-                [ -n "$pod_restarts" ] || pod_restarts="none"
-                printf 'Rancher not stable yet: pod=%s phase=%s ready=%s restarts=%s\n' \
-                  "$pod_name" "$pod_phase" "$pod_ready" "$pod_restarts"
-              fi
-
-              sleep "$interval"
-            done
-          }
-
-          wait_https_ok() {
-            log_step "Wait for Rancher HTTPS endpoint"
-            for attempt in $(seq 1 80); do
-              http_code="$(curl -kIs -o /dev/null -w '%{http_code}' --max-time 15 "https://$rancher_hostname" 2>/dev/null || true)"
-              if [ "$http_code" = "200" ]; then
-                curl -kIs --max-time 15 "https://$rancher_hostname" | sed -n '1,12p'
-                return 0
-              fi
-              [ -n "$http_code" ] || http_code="curl_failed"
-              echo "HTTPS not ready yet: HTTP $http_code"
-              sleep 15
-            done
-
-            echo "ERROR: Rancher HTTPS endpoint did not return HTTP 200" >&2
-            return 1
-          }
-
-          require_cmd kubectl
-          require_cmd helm
-          require_cmd openssl
-          require_cmd curl
-          kubectl kustomize --help >/dev/null 2>&1 || {
-            echo "ERROR: kubectl kustomize is required for Helm post-rendering" >&2
-            exit 2
-          }
-          if [ ! -r "$ca_bundle_source" ]; then
-            echo "ERROR: CA bundle is not readable: $ca_bundle_source" >&2
-            exit 2
           fi
-
-          log_step "Helm repositories"
-          helm repo add jetstack https://charts.jetstack.io --force-update >/dev/null
-          helm repo add "$rancher_chart_repo_name" "$rancher_chart_repo_url" --force-update >/dev/null
-          helm repo update >/dev/null
-
-          log_step "Namespaces"
-          kubectl create namespace "$cert_manager_namespace" --dry-run=client -o yaml | kubectl apply -f -
-          kubectl create namespace "$rancher_namespace" --dry-run=client -o yaml | kubectl apply -f -
-
-          log_step "Install or update cert-manager"
-          helm upgrade --install cert-manager jetstack/cert-manager \
-            --namespace "$cert_manager_namespace" \
-            --version "$cert_manager_version" \
-            --set crds.enabled=true \
-            --wait \
-            --timeout "$wait_timeout"
-
-          kubectl -n "$cert_manager_namespace" rollout status deploy/cert-manager --timeout="$wait_timeout"
-          kubectl -n "$cert_manager_namespace" rollout status deploy/cert-manager-webhook --timeout="$wait_timeout"
-          kubectl -n "$cert_manager_namespace" rollout status deploy/cert-manager-cainjector --timeout="$wait_timeout"
-
-          start_rancher_image_prepull
-
-          log_step "Additional CA secret for Rancher"
-          refresh_tls_ca_secret
-
-          log_step "Install Rancher Helm release"
-          write_rancher_values_file
-          export RANCHER_IMAGE_TAG="$rancher_image_tag"
-          write_rancher_post_renderer
-
-          if [ "$rancher_prepull" = "true" ]; then
-            kubectl -n "$rancher_namespace" rollout status daemonset/rancher-image-prepull --timeout="$wait_timeout" || true
+          chmod 0700 "$rancher_installer"
+          if [ -n "${this.rancher_secret}" ]; then
+            RANCHER_HOSTNAME="${env.domain}" BOOTSTRAP_PASSWORD="${this.rancher_secret}" bash "$rancher_installer"
+          else
+            RANCHER_HOSTNAME="${env.domain}" bash "$rancher_installer"
           fi
+      - if ('${this.rancher_existing}' != 'true'):
+          - message.email.send:
+              to: "${user.email}"
+              subject: Rancher Platform Successfully Installed in ${env.name}
+              body: |-
+                Rancher Management Platform installed in <b>${env.name}</b> Kubernetes Cluster: <br>
+                Rancher Dashboard - ${env.url}<br>
+                Your login password: ${this.rancher_secret}
+          - return:
+              type: success
+              message: |
+                Rancher Platform has been successfully installed!
 
-          helm upgrade --install rancher "$rancher_chart_repo_name/rancher" \
-            --namespace "$rancher_namespace" \
-            --version "$rancher_version" \
-            -f "$values_file" \
-            --post-renderer "$post_renderer" \
-            --wait=false \
-            --timeout "$wait_timeout"
+                Enter [Rancher dashboard](${env.url}), using password:
 
-          log_step "Stop stale Rancher ReplicaSets without the jailer patch"
-          while read -r rs; do
-            [ -n "$rs" ] || continue
-            init_names="$(kubectl -n "$rancher_namespace" get "$rs" -o jsonpath='{.spec.template.spec.initContainers[*].name}' 2>/dev/null || true)"
-            init_image="$(kubectl -n "$rancher_namespace" get "$rs" -o jsonpath='{.spec.template.spec.initContainers[?(@.name=="rancher-jailer-patch")].image}' 2>/dev/null || true)"
-            case "$init_names" in
-              *rancher-jailer-patch*) has_jailer_patch="true" ;;
-              *) has_jailer_patch="false" ;;
-            esac
-            if [ "$has_jailer_patch" != "true" ] || [ "$init_image" != "rancher/rancher:$rancher_image_tag" ]; then
-              echo "Scaling stale or incorrectly patched $rs to 0"
-              kubectl -n "$rancher_namespace" scale "$rs" --replicas=0
-            else
-              echo "Keeping patched $rs"
-            fi
-          done <<EOF
-          $(kubectl -n "$rancher_namespace" get rs -l app=rancher -o name)
-          EOF
-
-          log_step "Wait for Rancher"
-          kubectl -n "$rancher_namespace" rollout status deployment/rancher --timeout="$wait_timeout" || {
-            echo "Rancher did not become Ready. Recent status and logs follow." >&2
-            kubectl -n "$rancher_namespace" get deploy,rs,pods,svc,ingress -l app=rancher -o wide >&2 || true
-            kubectl -n "$rancher_namespace" logs -l app=rancher --all-containers --tail=250 --prefix >&2 || true
-            exit 1
-          }
-
-          kubectl -n "$rancher_namespace" get deploy,rs,pods,svc,ingress -l app=rancher -o wide
-          kubectl -n "$rancher_namespace" get issuer,certificate,certificaterequest 2>/dev/null || true
-
-          wait_rancher_stable
-
-          log_step "Wait for Rancher ingress certificate"
-          kubectl -n "$rancher_namespace" wait --for=condition=Ready issuer/rancher --timeout="$wait_timeout"
-          kubectl -n "$rancher_namespace" wait --for=condition=Ready certificate/tls-rancher-ingress --timeout="$wait_timeout"
-
-          wait_https_ok
-      - message.email.send:
-          to: "${user.email}"
-          subject: Rancher Platform Successfully Installed in ${env.name}
-          body: |-
-            Rancher Management Platform installed in <b>${env.name}</b> Kubernetes Cluster: <br>
-            Rancher Dashboard - ${env.url}<br>
-            Your login password: ${this.rancher_secret}
+                ```${this.rancher_secret}```
       - return:
           type: success
           message: |
-            Rancher Platform has been successfully installed!
+            Rancher Platform has been successfully repaired or updated.
 
-            Enter [Rancher dashboard](${env.url}), using password:
-
-            ```${this.rancher_secret}```
+            Existing Rancher credentials were not changed.
 
   - id: regcreds-k8s-addon
     type: update
