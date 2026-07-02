@@ -1031,19 +1031,12 @@ addons:
           kubectl delete -f ${baseUrl}/addons/ingress/${globals.ingress-dir}/helloworld-ingress.yaml ||:
           kubectl delete -f ${baseUrl}/addons/helloworld.yaml ||:
       - cmd[${nodes.k8sm.master.id}]: |-
-          http_code=$(curl -Lks -o /dev/null -w "%{http_code}" "${env.url}")
-          ret_code=$?
-          if [ ${ret_code} -ne 0 ]; then
-            echo "An error occurred while accessing the [endpoint](${env.url})"
-          elif [ ${http_code} -eq 200 ]; then
-            echo "The [endpoint](${env.url}) is already taken"
-          elif [ ${http_code} -ne 404 ]; then
-            echo "The [endpoint](${env.url}) is present and answered with HTTP code ${http_code}"
-          fi
+          kubectl get ingress -A -o jsonpath='{range .items[*]}{.metadata.namespace}{" "}{.metadata.name}{" "}{range .spec.rules[*]}{.host}{" "}{range .http.paths[*]}{.path}{"\n"}{end}{end}{end}' |
+            awk '$3 == "${env.domain}" && ($4 == "/" || $4 == "") && !($1 == "cattle-system" && $2 == "rancher") { print $1 "/" $2 }'
       - if ('${response.out}'):
           return:
             type: warning
-            message: Cannot deploy Rancher UI! ${response.out}.
+            message: Cannot deploy Rancher UI. Root ingress for ${env.domain} is already used by ${response.out}.
       - cmd[${nodes.k8sm.master.id}]: cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 32 | head -n 1
       - set:
           rancher_secret: ${response.out}
