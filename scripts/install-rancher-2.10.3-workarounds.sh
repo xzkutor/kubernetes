@@ -231,6 +231,39 @@ spec:
 EOF
 }
 
+refresh_tls_ca_secret() {
+  local ca_data get_error get_rc patch_file
+
+  get_error="$(mktemp)"
+  patch_file="$(mktemp)"
+  TMP_FILES+=("$get_error" "$patch_file")
+
+  if kubectl -n "$RANCHER_NAMESPACE" get secret tls-ca-additional >/dev/null 2>"$get_error"; then
+    ca_data="$(base64 "$CA_BUNDLE_SOURCE" | tr -d '\n')"
+    cat >"$patch_file" <<EOF
+{"data":{"ca-additional.pem":"$ca_data"}}
+EOF
+    if kubectl patch --help 2>/dev/null | grep -q -- '--patch-file'; then
+      kubectl -n "$RANCHER_NAMESPACE" patch secret tls-ca-additional \
+        --type=merge \
+        --patch-file "$patch_file"
+    else
+      kubectl -n "$RANCHER_NAMESPACE" patch secret tls-ca-additional \
+        --type=merge \
+        -p "$(cat "$patch_file")"
+    fi
+  else
+    get_rc=$?
+    if grep -Eqi 'notfound|not found' "$get_error"; then
+      kubectl -n "$RANCHER_NAMESPACE" create secret generic tls-ca-additional \
+        --from-file=ca-additional.pem="$CA_BUNDLE_SOURCE"
+    else
+      cat "$get_error" >&2
+      return "$get_rc"
+    fi
+  fi
+}
+
 wait_rancher_stable() {
   local stable_seconds="$RANCHER_STABLE_SECONDS"
   local interval=15
@@ -331,9 +364,7 @@ kubectl -n "$CERT_MANAGER_NAMESPACE" rollout status deploy/cert-manager-cainject
 start_rancher_image_prepull
 
 log "Additional CA secret for Rancher"
-kubectl -n "$RANCHER_NAMESPACE" create secret generic tls-ca-additional \
-  --from-file=ca-additional.pem="$CA_BUNDLE_SOURCE" \
-  --dry-run=client -o yaml | kubectl apply -f -
+refresh_tls_ca_secret
 
 log "Install or update Rancher Helm release"
 write_rancher_values_file

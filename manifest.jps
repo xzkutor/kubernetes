@@ -1257,6 +1257,37 @@ addons:
           EOF
           }
 
+          refresh_tls_ca_secret() {
+            get_error="$(mktemp)"
+            patch_file="$(mktemp)"
+            tmp_files="$tmp_files $get_error $patch_file"
+
+            if kubectl -n "$rancher_namespace" get secret tls-ca-additional >/dev/null 2>"$get_error"; then
+              ca_data="$(base64 "$ca_bundle_source" | tr -d '\n')"
+              cat >"$patch_file" <<EOF
+          {"data":{"ca-additional.pem":"$ca_data"}}
+          EOF
+              if kubectl patch --help 2>/dev/null | grep -q -- '--patch-file'; then
+                kubectl -n "$rancher_namespace" patch secret tls-ca-additional \
+                  --type=merge \
+                  --patch-file "$patch_file"
+              else
+                kubectl -n "$rancher_namespace" patch secret tls-ca-additional \
+                  --type=merge \
+                  -p "$(cat "$patch_file")"
+              fi
+            else
+              get_rc=$?
+              if grep -Eqi 'notfound|not found' "$get_error"; then
+                kubectl -n "$rancher_namespace" create secret generic tls-ca-additional \
+                  --from-file=ca-additional.pem="$ca_bundle_source"
+              else
+                cat "$get_error" >&2
+                return "$get_rc"
+              fi
+            fi
+          }
+
           wait_rancher_stable() {
             stable=0
             last_restarts=""
@@ -1353,9 +1384,7 @@ addons:
           start_rancher_image_prepull
 
           log_step "Additional CA secret for Rancher"
-          kubectl -n "$rancher_namespace" create secret generic tls-ca-additional \
-            --from-file=ca-additional.pem="$ca_bundle_source" \
-            --dry-run=client -o yaml | kubectl apply -f -
+          refresh_tls_ca_secret
 
           log_step "Install Rancher Helm release"
           write_rancher_values_file
