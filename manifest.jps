@@ -1025,14 +1025,6 @@ addons:
 
     actions:
       addon-rancher:
-      - return:
-          type: warning
-          message: Rancher Management Platform is not compatible with K8s 1.31 yet!
-      - cmd[${nodes.k8sm.master.id}]: kubectl -n cattle-system get deployment rancher &>/dev/null && echo "true" || echo "false"
-      - if ('${response.out}' == 'true'):
-          return:
-            type: info
-            message: Rancher Management Platform is already installed!
       - init-globals-ingress
       - if ('${globals.ingress-dir}' != 'nginx'):
           return:
@@ -1042,42 +1034,59 @@ addons:
           kubectl delete -f ${baseUrl}/addons/ingress/${globals.ingress-dir}/helloworld-ingress.yaml ||:
           kubectl delete -f ${baseUrl}/addons/helloworld.yaml ||:
       - cmd[${nodes.k8sm.master.id}]: |-
-          http_code=$(curl -Lks -o /dev/null -w "%{http_code}" "${env.url}")
-          ret_code=$?
-          if [ ${ret_code} -ne 0 ]; then
-            echo "An error occurred while accessing the [endpoint](${env.url})"
-          elif [ ${http_code} -eq 200 ]; then
-            echo "The [endpoint](${env.url}) is already taken"
-          elif [ ${http_code} -ne 404 ]; then
-            echo "The [endpoint](${env.url}) is present and answered with HTTP code ${http_code}"
-          fi
+          kubectl get ingress -A -o jsonpath='{range .items[*]}{.metadata.namespace}{" "}{.metadata.name}{" "}{range .spec.rules[*]}{.host}{" "}{range .http.paths[*]}{.path}{"\n"}{end}{end}{end}' |
+            awk '$3 == "${env.domain}" && ($4 == "/" || $4 == "") && !($1 == "cattle-system" && $2 == "rancher") { print $1 "/" $2 }'
       - if ('${response.out}'):
           return:
             type: warning
-            message: Cannot deploy Rancher UI! ${response.out}.
-      - cmd[${nodes.k8sm.master.id}]: cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 32 | head -n 1
+            message: Cannot deploy Rancher UI. Root ingress for ${env.domain} is already used by ${response.out}.
+      - cmd[${nodes.k8sm.master.id}]: kubectl -n cattle-system get deployment rancher &>/dev/null && echo "true" || echo "false"
       - set:
-          rancher_secret: ${response.out}
+          rancher_existing: ${response.out}
+      - if ('${this.rancher_existing}' != 'true'):
+          - cmd[${nodes.k8sm.master.id}]: cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 32 | head -n 1
+          - set:
+              rancher_secret: ${response.out}
+      - else:
+          - set:
+              rancher_secret: ""
       - cmd[${nodes.k8sm.master.id}]: |-
-          helm repo add rancher-stable https://releases.rancher.com/server-charts/stable
-          helm repo update
-          helm install rancher rancher-stable/rancher --create-namespace --namespace cattle-system --set tls=external --set bootstrapPassword="${this.rancher_secret}"
-          kubectl -n cattle-system rollout status deploy/rancher
-      - message.email.send:
-          to: "${user.email}"
-          subject: Rancher Platform Successfully Installed in ${env.name}
-          body: |-
-            Rancher Management Platform installed in <b>${env.name}</b> Kubernetes Cluster: <br>
-            Rancher Dashboard - ${env.url}<br>
-            Your login password: ${this.rancher_secret}
+          rancher_installer="/tmp/install-rancher-workarounds.sh"
+          rancher_installer_url="${baseUrl}/scripts/install-rancher-workarounds.sh"
+          if ! curl -fsSL "$rancher_installer_url" -o "$rancher_installer"; then
+            if ! wget -qO "$rancher_installer" "$rancher_installer_url"; then
+              echo "ERROR: cannot download Rancher installer helper from $rancher_installer_url" >&2
+              exit 2
+            fi
+          fi
+          chmod 0700 "$rancher_installer"
+          if [ -n "${this.rancher_secret}" ]; then
+            RANCHER_HOSTNAME="${env.domain}" BOOTSTRAP_PASSWORD="${this.rancher_secret}" bash "$rancher_installer"
+          else
+            RANCHER_HOSTNAME="${env.domain}" bash "$rancher_installer"
+          fi
+      - if ('${this.rancher_existing}' != 'true'):
+          - message.email.send:
+              to: "${user.email}"
+              subject: Rancher Platform Successfully Installed in ${env.name}
+              body: |-
+                Rancher Management Platform installed in <b>${env.name}</b> Kubernetes Cluster: <br>
+                Rancher Dashboard - ${env.url}<br>
+                Your login password: ${this.rancher_secret}
+          - return:
+              type: success
+              message: |
+                Rancher Platform has been successfully installed!
+
+                Enter [Rancher dashboard](${env.url}), using password:
+
+                ```${this.rancher_secret}```
       - return:
           type: success
           message: |
-            Rancher Platform has been successfully installed!
+            Rancher Platform has been successfully repaired or updated.
 
-            Enter [Rancher dashboard](${env.url}), using password:
-
-            ```${this.rancher_secret}```
+            Existing Rancher credentials were not changed.
 
   - id: regcreds-k8s-addon
     type: update
